@@ -4,12 +4,14 @@
 
 {-# LANGUAGE ForeignFunctionInterface #-}
 {-# LANGUAGE NoMonomorphismRestriction #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 #include <gpgme.h>
 
 module Bindings where
 
 import           Control.Applicative ((<$>), (<*>))
+import           Data.Bits
 import qualified Data.Text as Text
 import           Foreign.C
 import           Foreign.C.String
@@ -17,6 +19,9 @@ import           Foreign.ForeignPtr
 import           Foreign.Marshal.Alloc
 import           Foreign.Ptr
 import           Foreign.Storable
+import           System.IO.Unsafe (unsafePerformIO)
+
+toFlags = foldr
 
 {#context lib = "gpgme" prefix = "gpgme" #}
 
@@ -71,3 +76,47 @@ withCtx = fromCtx
 {#fun new as ctxNew
    {alloca- `Ctx' mkContext*}
    -> `Maybe Error' toError* #}
+
+{#fun release as ctxRelease
+   {withCtx `Ctx'}
+   -> `()' #}
+
+{#enum gpgme_validity_t as Validity {underscoreToCase} deriving (Show) #}
+{#enum attr_t as Attr {underscoreToCase} deriving (Show) #}
+fromAttr = fromIntegral . fromEnum
+
+{#pointer gpgme_key_t as Key foreign newtype #}
+
+
+------------------------------------
+-- List Keys
+------------------------------------
+-- getKeys (Ctx ctx) = do
+--     {#call gpgme_op_keylist_start #} ctx nullPtr 0
+
+foreign import ccall "gpgme.h &gpgme_key_unref"
+    unrefPtr :: FunPtr (Ptr Key -> IO ())
+
+getKeys (Ctx ctx) = do
+    {#call gpgme_op_keylist_start #} ctx nullPtr 0
+    alloca takeKeys
+  where
+    takeKeys (buf :: Ptr (Ptr Key)) = do
+        e <- toError =<< {#call gpgme_op_keylist_next#} ctx buf
+        case e of
+            Nothing -> do
+                keyPtr <- peek buf
+                key <- newForeignPtr unrefPtr keyPtr
+                (Key key :) <$> takeKeys buf
+            Just e -> case errCode e of
+                ErrEof -> return []
+                _ -> error "takeKeys"
+
+reserved f = f nullPtr
+
+{#fun pure gpgme_key_get_string_attr as keyGetStringAttr
+   { withKey* `Key'
+   , fromAttr `Attr'
+   , reserved- `Ptr()'
+   , `Int'
+   } -> `String' #}
