@@ -17,6 +17,9 @@ library
   exposed-modules:   GpgMe, Bindings
   build-depends:     base >= 4 && <5
                    , text
+                   , bytestring
+                   , openpgp
+                   , binary
 --  C-Sources:	     src/cbits/wrapper.c
   build-tools:	     c2hs
   extra-libraries:   gpgme, assuan, gpg-error
