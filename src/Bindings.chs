@@ -15,6 +15,7 @@ import           Control.Applicative ((<$>), (<*>))
 import qualified Control.Exception as Ex
 import           Data.Bits
 import qualified Data.ByteString as BS
+import qualified Data.ByteString.Unsafe as BS
 import qualified Data.Text as Text
 import           Data.Typeable
 import           Foreign.C
@@ -27,6 +28,8 @@ import           Foreign.Storable
 import           System.IO.Unsafe (unsafePerformIO)
 
 toFlags = foldr
+
+fromEnum' = fromIntegral . fromEnum
 
 {#context lib = "gpgme" prefix = "gpgme" #}
 
@@ -96,7 +99,7 @@ withCtx x f = f =<< return (fromCtx x)
 
 {#enum gpgme_validity_t as Validity {underscoreToCase} deriving (Show) #}
 {#enum attr_t as Attr {underscoreToCase} deriving (Show) #}
-fromAttr = fromIntegral . fromEnum
+
 
 
 ------------------------------------
@@ -114,8 +117,9 @@ withKeysArray ks f = withKeys ks $ \ksPtrs -> withArray0 nullPtr ksPtrs f
 foreign import ccall "gpgme.h &gpgme_key_unref"
     unrefPtr :: FunPtr (Ptr Key -> IO ())
 
-getKeys (Ctx ctx) = do
-    {#call gpgme_op_keylist_start #} ctx nullPtr 0
+getKeys :: Ctx -> Bool -> IO [Key]
+getKeys (Ctx ctx) secretOnly= do
+    {#call gpgme_op_keylist_start #} ctx nullPtr (fromEnum' secretOnly)
     alloca takeKeys
   where
     takeKeys (buf :: Ptr (Ptr Key)) = do
@@ -135,7 +139,7 @@ reserved0 f = f 0
 
 {#fun pure key_get_string_attr as ^
    { withKey* `Key'
-   , fromAttr `Attr'
+   , fromEnum' `Attr'
    , reserved- `Ptr()'
    , `Int'
    } -> `Maybe Text.Text' toMaybeText* #}
@@ -146,6 +150,7 @@ reserved0 f = f 0
 
 newtype DataBuffer = DataBuffer {fromDataBuffer :: Ptr ()}
 mkDataBuffer = fmap DataBuffer . peek
+withDataBuffer (DataBuffer buf) f = f buf
 
 toMaybeText ptr = if ptr == nullPtr
                 then return Nothing
@@ -185,4 +190,43 @@ getKeyBS ctx key = do
     exp <- exportKey ctx [key] db
     getDataBufferBytes db
 
+unsafeUseAsCStringLen' bs f =
+    BS.unsafeUseAsCStringLen bs $ \(bs, l) -> f (bs, fromIntegral l)
+
+{# fun data_new_from_mem as ^
+   { alloca- `DataBuffer' mkDataBuffer*
+   , unsafeUseAsCStringLen' * `BS.ByteString'&
+   , fromEnum' `Bool'
+   } -> `Error' throwError- #}
+
+{# fun data_release as ^
+   { withDataBuffer* `DataBuffer'} -> `()' #}
+
+{# fun set_armor as ^
+     { withCtx* `Ctx'
+     , fromEnum' `Bool'
+     } -> `()' #}
+
+-----------------------------------
+-- Signing
+-----------------------------------
+
+{#fun signers_clear as ^
+    {withCtx* `Ctx'} -> `()'#}
+
+{#fun signers_add as ^
+    { withCtx* `Ctx'
+    , withKey* `Key'
+    } -> `Error' throwError- #}
+
+{# enum sig_mode_t as SigMode {underscoreToCase}
+       with prefix = "GPGME"
+       deriving (Show) #}
+
+{#fun op_sign as ^
+    { withCtx* `Ctx'
+    , withDataBuffer* `DataBuffer'
+    , withDataBuffer* `DataBuffer'
+    , fromEnum' `SigMode'
+    } -> `Error' throwError- #}
 --     exportKey
