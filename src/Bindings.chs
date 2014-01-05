@@ -13,6 +13,7 @@ module Bindings where
 
 import           Control.Applicative ((<$>), (<*>))
 import qualified Control.Exception as Ex
+import           Control.Monad
 import           Data.Bits
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Unsafe as BS
@@ -27,9 +28,17 @@ import           Foreign.Ptr
 import           Foreign.Storable
 import           System.IO.Unsafe (unsafePerformIO)
 
-toFlags = foldr
-
+fromEnum' :: (Enum a, Num b) => a -> b
 fromEnum' = fromIntegral . fromEnum
+
+toEnum' :: (Enum c, Integral a) => a -> c
+toEnum' = toEnum . fromIntegral
+
+toFlags :: (Enum a, Num b, Data.Bits.Bits b) => [a] -> b
+toFlags = foldr (.|.) 0 . map fromEnum'
+
+-- fromFlags x = filter (\y -> let y' = fromEnum' y in x .|. y' == y')
+--                      [minBound..maxBound]
 
 {#context lib = "gpgme" prefix = "gpgme" #}
 
@@ -91,7 +100,7 @@ withCtx x f = f =<< return (fromCtx x)
 
 {#fun new as ctxNew
    {alloca- `Ctx' mkContext*}
-   -> `Maybe Error' toError* #}
+   -> `()' throwError*- #}
 
 {#fun release as ctxRelease
    {withCtx* `Ctx'}
@@ -161,7 +170,7 @@ withMaybeText (Just txt) = withCString (Text.unpack txt)
 
 {#fun data_new as ^
    { alloca- `DataBuffer' mkDataBuffer* }
-   -> `Error' throwError- #}
+   -> `()' throwError*- #}
 
 peekInt = fmap fromIntegral . peek
 
@@ -173,8 +182,11 @@ peekInt = fmap fromIntegral . peek
 getDataBufferBytes :: DataBuffer -> IO BS.ByteString
 getDataBufferBytes db = do
     (dt, len) <- dataReleaseAndGetMem db
-    res <- BS.packCStringLen (castPtr dt, len)
-    {#call free#} dt
+    res <- if dt == nullPtr then return BS.empty
+                            else do
+               bs <- BS.packCStringLen (castPtr dt, len)
+               {#call free#} dt
+               return bs
     return res
 
 {# fun gpgme_op_export_keys as exportKey
@@ -182,7 +194,7 @@ getDataBufferBytes db = do
    , withKeysArray* `[Key]'
    , reserved0- `CUInt'
    , fromDataBuffer `DataBuffer'
-   } -> `Error' throwError- #}
+   } -> `Error' throwError*- #}
 
 getKeyBS :: Ctx -> Key -> IO BS.ByteString
 getKeyBS ctx key = do
@@ -197,7 +209,7 @@ unsafeUseAsCStringLen' bs f =
    { alloca- `DataBuffer' mkDataBuffer*
    , unsafeUseAsCStringLen' * `BS.ByteString'&
    , fromEnum' `Bool'
-   } -> `Error' throwError- #}
+   } -> `Error' throwError*- #}
 
 {# fun data_release as ^
    { withDataBuffer* `DataBuffer'} -> `()' #}
@@ -206,6 +218,18 @@ unsafeUseAsCStringLen' bs f =
      { withCtx* `Ctx'
      , fromEnum' `Bool'
      } -> `()' #}
+
+withBSData bs =
+    Ex.bracket (dataNewFromMem bs True)
+               dataRelease
+
+withBSBuffer f =
+    Ex.bracketOnError dataNew
+                      dataRelease
+                      $ \db -> do
+                          f db
+                          getDataBufferBytes db
+
 
 -----------------------------------
 -- Signing
@@ -217,7 +241,7 @@ unsafeUseAsCStringLen' bs f =
 {#fun signers_add as ^
     { withCtx* `Ctx'
     , withKey* `Key'
-    } -> `Error' throwError- #}
+    } -> `()' throwError* #}
 
 {# enum sig_mode_t as SigMode {underscoreToCase}
        with prefix = "GPGME"
@@ -228,5 +252,59 @@ unsafeUseAsCStringLen' bs f =
     , withDataBuffer* `DataBuffer'
     , withDataBuffer* `DataBuffer'
     , fromEnum' `SigMode'
-    } -> `Error' throwError- #}
+    } -> `()' throwError*- #}
 --     exportKey
+
+-- | Sign a text using a private signing key from the GPG keychain
+sign :: Ctx
+     -> BS.ByteString -- ^ Text to sign
+     -> Key -- ^ Signing key to use
+     -> SigMode -- ^ Signing mode
+     -> IO BS.ByteString
+sign ctx plain key mode = withBSData plain $ \plainData ->
+                          withBSBuffer $ \outData -> (do
+    signersClear ctx
+    signersAdd ctx key
+    opSign ctx plainData outData mode)
+       `Ex.finally` signersClear ctx
+
+{# enum sigsum_t as SigSummary {underscoreToCase} deriving (Bounded, Show)#}
+{# enum sig_stat_t as SigStat {underscoreToCase} deriving (Bounded, Show)#}
+
+{#fun op_verify as ^
+   { withCtx* `Ctx'
+   , withDataBuffer* `DataBuffer' -- sig
+   , withDataBuffer* `DataBuffer' -- signed-text
+   , withDataBuffer* `DataBuffer' -- plain
+   } -> `()' throwError*- #}
+
+checkVerifyResult :: Ctx -> IO SigStat
+checkVerifyResult ctx = withCtx ctx $ \ctx' -> do
+    alloca $ \sigStatPtr -> do
+        res <- {#call get_sig_status#} ctx' 0 sigStatPtr nullPtr
+        if (res == nullPtr)
+            then return SigStatNosig
+            else do
+                sigStat <- peek sigStatPtr
+                return $! (toEnum' sigStat :: SigStat)
+
+
+-- | Verify a signature created in 'SigModeDetach' mode
+verifyDetach :: Ctx
+             -> BS.ByteString -- ^ The source text that the signature pertains to
+             -> BS.ByteString -- ^ The signature
+             -> IO SigStat
+verifyDetach ctx signedText sig = withBSData signedText $ \stData ->
+                                  withBSData sig $ \sigData -> do
+    opVerify ctx sigData stData (DataBuffer nullPtr)
+    checkVerifyResult ctx
+
+-- | Verify a signature created in 'SigModeNormal' or 'SigModeClear' mode
+verify :: Ctx
+        -> BS.ByteString -- ^ Text and attached Signature
+        -> IO (SigStat, BS.ByteString) -- ^ result and extracted plain text
+verify ctx sig = withBSData sig $ \sigData -> do
+    plain <- withBSBuffer $ \plainData ->
+        opVerify ctx sigData (DataBuffer nullPtr) plainData
+    res <- checkVerifyResult ctx
+    return (res, plain)
