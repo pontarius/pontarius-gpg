@@ -18,10 +18,21 @@ sgnGood = "-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA256\n\nlorem ipsum dolor
 
 sgnBad = "-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA256\n\nlorem ipsum dolor sit amet\n-----BEGIN PGP SIGNATURE-----\nVersion: GnuPG v2.0.22 (GNU/Linux)\n\niF4EAREIAAYFAlLIMucACgkQBcfk+3ZQIFLvzQEAtQ1Mmm3GuQ9qUpM3Wxi1xtFC\nl/qwvDMT0lZijdO8O4AA/RTCc9ZpKtRhEd8TiNEA0zLgx93YQ7suwq8X334E3xrs\n=CgkI\n-----END PGP SIGNATURE-----\n"
 
+getPwd uidHint pInfo bad = do
+    putStr "uidHint :"
+    putStrLn uidHint
+    putStr "Password Info :"
+    putStrLn pInfo
+    putStr "Was bad? "
+    print bad
+    getLine
+
 main = do
     checkVersion Nothing
     ctx <- ctxNew
-    (key:keys) <- getKeys ctx True
+    setPassphraseCallback ctx getPwd
+    (keys) <- getKeys ctx True
+    print $ length keys
     sgn <- sign ctx "Das Pferd frisst keinen Gurkensalat" (head keys) SigModeClear
     print =<< verifyDetach ctx "Das Pferd frisst keinen Gurkensalat" sgn
     print =<< verify ctx sgnGood

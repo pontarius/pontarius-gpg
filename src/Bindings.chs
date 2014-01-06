@@ -27,6 +27,8 @@ import           Foreign.Marshal.Array
 import           Foreign.Ptr
 import           Foreign.Storable
 import           System.IO.Unsafe (unsafePerformIO)
+import           System.Posix.Types
+import           System.Posix.IO
 
 fromEnum' :: (Enum a, Num b) => a -> b
 fromEnum' = fromIntegral . fromEnum
@@ -96,7 +98,7 @@ checkVersion (Just txt) = withCString (Text.unpack txt) $ \buf -> do
 -- gpgme_engine_check_version (gpgme_protocol_t protocol)
 
 mkContext = fmap Ctx . peek
-withCtx x f = f =<< return (fromCtx x)
+withCtx x f = f $ fromCtx x
 
 {#fun new as ctxNew
    {alloca- `Ctx' mkContext*}
@@ -308,3 +310,32 @@ verify ctx sig = withBSData sig $ \sigData -> do
         opVerify ctx sigData (DataBuffer nullPtr) plainData
     res <- checkVerifyResult ctx
     return (res, plain)
+
+--------------------------------
+-- Passphrases
+--------------------------------
+
+-- gpgme_error_t (*gpgme_passphrase_cb_t)(void *hook, const char *uid_hint, const char *passphrase_info, int prev_was_bad, int fd)
+
+type PassphraseCallback = Ptr () -- ^ Hook
+                        -> Ptr CChar -- ^ Uid Hint
+                        -> Ptr CChar -- ^ passphrase info
+                        -> CInt -- ^ Was Bad?
+                        -> CInt -- ^ fd
+                        -> IO CUInt
+
+foreign import ccall "wrapper"
+  mkPasswordCallback  :: PassphraseCallback -> IO (FunPtr PassphraseCallback)
+
+setPassphraseCallback :: Ctx
+                      -> (String -> String -> Bool -> IO String)
+                      -> IO ()
+setPassphraseCallback ctx f = do
+    let cbFun _ uidHint pInfo bad fd = do
+               uidHintString <- peekCString uidHint
+               pInfoString <- peekCString pInfo
+               out <- f uidHintString pInfoString (bad == 0)
+               fdWrite (Fd fd) (filter (/= '\n') out ++ "\n" )
+               return 0
+    cb <- mkPasswordCallback cbFun
+    withCtx ctx $ \ctxPtr -> {# call set_passphrase_cb #} ctxPtr cb nullPtr
