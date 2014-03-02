@@ -13,22 +13,22 @@ module Bindings where
 
 import           Control.Applicative ((<$>), (<*>))
 import qualified Control.Exception as Ex
-import           Control.Monad
 import           Data.Bits
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Unsafe as BS
+import           Data.Text (Text)
 import qualified Data.Text as Text
 import           Data.Typeable
 import           Foreign.C
-import           Foreign.C.String
 import           Foreign.ForeignPtr
 import           Foreign.Marshal.Alloc
 import           Foreign.Marshal.Array
+import           Foreign.Marshal.Utils
 import           Foreign.Ptr
 import           Foreign.Storable
 import           System.IO.Unsafe (unsafePerformIO)
-import           System.Posix.Types
 import           System.Posix.IO
+import           System.Posix.Types
 
 fromEnum' :: (Enum a, Num b) => a -> b
 fromEnum' = fromIntegral . fromEnum
@@ -44,7 +44,7 @@ toFlags = foldr (.|.) 0 . map fromEnum'
 
 {#context lib = "gpgme" prefix = "gpgme" #}
 
-newtype Ctx = Ctx {fromCtx :: {#type gpgme_ctx_t#} }
+{#pointer gpgme_ctx_t as Ctx foreign newtype#}
 
 instance Show Ctx where
     show _ = "<GpgMe.CTX>"
@@ -65,6 +65,7 @@ data Error = Error { errCode :: ErrorCode
 
 instance Ex.Exception Error
 
+throwError :: CUInt -> IO ()
 throwError e' = do
     mbe <- toError e'
     case mbe of
@@ -76,42 +77,55 @@ gpgme_err_code_t gpgme_err_code_uninlined (gpgme_error_t err);
 gpgme_err_source_t gpgme_err_source_uninlined (gpgme_error_t err);
 #endc
 
+toError :: CUInt -> IO (Maybe Error)
 toError err = case err of
     0 -> return Nothing
     _ -> Just <$>
          (allocaBytes 256 $ \buff -> do -- We hope that any error message will
                                         -- be less than 256 bytes long
-               {#call strerror_r#} err buff 256
+               _ <- {#call strerror_r#} err buff 256
                Error <$> (toEnum . fromIntegral
                           <$> {# call err_code_uninlined #} err)
                      <*> (toEnum . fromIntegral
                           <$> {# call err_source_uninlined #} err)
                      <*> (Text.pack <$> peekCString buff))
 
+checkVersion :: Maybe Text -> IO (Maybe Text)
 checkVersion Nothing = Just . Text.pack <$>
                          (peekCString =<< {#call check_version#} nullPtr)
 checkVersion (Just txt) = withCString (Text.unpack txt) $ \buf -> do
-    {#call check_version#} buf
+    _ <- {#call check_version#} buf
     return Nothing
 
--- {#enum gpgme_protocol_t as Protocol {underscoreToCase} #}
+
+{#enum gpgme_protocol_t as Protocol {underscoreToCase} deriving (Show, Eq)#}
 -- gpgme_engine_check_version (gpgme_protocol_t protocol)
 
-mkContext = fmap Ctx . peek
-withCtx x f = f $ fromCtx x
+foreign import ccall unsafe "&gpgme_release"
+    releaseCtx :: FunPtr (Ptr Ctx -> IO ())
 
-{#fun new as ctxNew
+mkContext :: Ptr (Ptr Ctx) -> IO Ctx
+mkContext p = do
+    if p == nullPtr
+        then Ex.throw (Ex.AssertionFailed "nullPtr")
+        else fmap Ctx $ newForeignPtr releaseCtx  . castPtr =<< peek p
+
+
+-- withCtx :: Ctx -> (Ptr Ctx -> IO t) -> IO t
+-- withCtx x f = withForeignPtr (fromCtx x) f
+
+{#fun new as ctxNew'
    {alloca- `Ctx' mkContext*}
    -> `()' throwError*- #}
 
-{#fun release as ctxRelease
-   {withCtx* `Ctx'}
-   -> `()' #}
+-- | Check that version constraint is satisfied and create a new context
+ctxNew :: Maybe Text -> IO Ctx
+ctxNew minVersion = do
+    _ <- checkVersion minVersion
+    ctxNew'
 
 {#enum gpgme_validity_t as Validity {underscoreToCase} deriving (Show) #}
 {#enum attr_t as Attr {underscoreToCase} deriving (Show) #}
-
-
 
 ------------------------------------
 -- Keys
@@ -120,7 +134,7 @@ withCtx x f = f $ fromCtx x
 {#pointer gpgme_key_t as Key foreign newtype #}
 
 withKeysArray :: [Key] -> (Ptr (Ptr Key) -> IO b) -> IO b
-withKeysArray ks f = withKeys ks $ \ksPtrs -> withArray0 nullPtr ksPtrs f
+withKeysArray ks' f = withKeys ks' $ \ksPtrs -> withArray0 nullPtr ksPtrs f
   where
     withKeys []     g = g []
     withKeys (k:ks) g = withKey k $ \kPtr -> withKeys ks (g . (kPtr:))
@@ -128,45 +142,52 @@ withKeysArray ks f = withKeys ks $ \ksPtrs -> withArray0 nullPtr ksPtrs f
 foreign import ccall "gpgme.h &gpgme_key_unref"
     unrefPtr :: FunPtr (Ptr Key -> IO ())
 
-getKeys :: Ctx -> Bool -> IO [Key]
-getKeys (Ctx ctx) secretOnly= do
-    {#call gpgme_op_keylist_start #} ctx nullPtr (fromEnum' secretOnly)
-    alloca takeKeys
+getKeys :: Ctx
+        -> Bool -- ^ Only keys with secret
+        -> IO [Key]
+getKeys ctx secretOnly = withCtx ctx $ \ctxPtr -> do
+    _ <- {#call gpgme_op_keylist_start #} ctxPtr nullPtr (fromEnum' secretOnly)
+    alloca $ takeKeys ctxPtr
   where
-    takeKeys (buf :: Ptr (Ptr Key)) = do
-        e <- toError =<< {#call gpgme_op_keylist_next#} ctx buf
+    takeKeys ctxPtr (buf :: Ptr (Ptr Key)) = do
+        e <- toError =<< {#call gpgme_op_keylist_next#} ctxPtr buf
         case e of
             Nothing -> do
                 keyPtr <- peek buf
                 key <- newForeignPtr unrefPtr keyPtr
-                (Key key :) <$> takeKeys buf
+                (Key key :) <$> takeKeys ctxPtr buf
             Just e -> case errCode e of
                 ErrEof -> return []
                 _ -> error "takeKeys"
 
+reserved :: (Ptr a -> t) -> t
 reserved f = f nullPtr
 
+reserved0 :: Num a => (a -> t) -> t
 reserved0 f = f 0
 
-{#fun pure key_get_string_attr as ^
+{#fun key_get_string_attr as ^
    { withKey* `Key'
    , fromEnum' `Attr'
    , reserved- `Ptr()'
    , `Int'
-   } -> `Maybe Text.Text' toMaybeText* #}
+   } -> `Maybe BS.ByteString' toMaybeText* #}
 
 -------------------------------
 -- Data Buffers
 -------------------------------
 
 newtype DataBuffer = DataBuffer {fromDataBuffer :: Ptr ()}
+mkDataBuffer :: Ptr (Ptr ()) -> IO DataBuffer
 mkDataBuffer = fmap DataBuffer . peek
+
+withDataBuffer :: DataBuffer -> (Ptr () -> t) -> t
 withDataBuffer (DataBuffer buf) f = f buf
 
-toMaybeText ptr = if ptr == nullPtr
-                then return Nothing
-                else Just . Text.pack <$> peekCString ptr
+toMaybeText :: Ptr CChar -> IO (Maybe BS.ByteString)
+toMaybeText ptr = maybePeek BS.packCString ptr
 
+withMaybeText :: Maybe Text -> (Ptr CChar -> IO a) -> IO a
 withMaybeText Nothing = ($ nullPtr)
 withMaybeText (Just txt) = withCString (Text.unpack txt)
 
@@ -198,12 +219,39 @@ getDataBufferBytes db = do
    , fromDataBuffer `DataBuffer'
    } -> `Error' throwError*- #}
 
+data ImportStatus = ImportStatus { isFprint :: String
+                                 , isResult :: Maybe Error
+                                 , isStatus :: Int -- TODO: convert to flags
+                                 }
+
+importKey :: Ctx -> DataBuffer -> IO [ImportStatus]
+importKey ctx keyBuffer = withCtx ctx $ \ctxPtr ->
+                          withDataBuffer keyBuffer $ \keyPtr -> do
+    throwError =<< {#call op_import#} ctxPtr keyPtr
+    result <- {#call op_import_result #} ctxPtr
+    walkImports =<< {#get import_result_t.imports#} result
+  where
+    walkImports ptr = if ptr == nullPtr
+                      then return []
+                      else do
+        is <- ImportStatus <$> (peekCString =<< {#get import_status_t.fpr #} ptr)
+                           <*> (toError =<< {#get import_status_t.result #} ptr)
+                           <*> (fromIntegral <$> {#get import_status_t.status #} ptr)
+        (is:) <$> (walkImports =<< {#get import_status_t.next #} ptr)
+
+
+importKeyBS ctx bs = withBSData bs $ importKey ctx
+
 getKeyBS :: Ctx -> Key -> IO BS.ByteString
 getKeyBS ctx key = do
     db <- dataNew
     exp <- exportKey ctx [key] db
     getDataBufferBytes db
 
+unsafeUseAsCStringLen' :: Num t =>
+                          BS.ByteString
+                       -> ((Ptr CChar, t) -> IO a)
+                       -> IO a
 unsafeUseAsCStringLen' bs f =
     BS.unsafeUseAsCStringLen bs $ \(bs, l) -> f (bs, fromIntegral l)
 
@@ -221,10 +269,12 @@ unsafeUseAsCStringLen' bs f =
      , fromEnum' `Bool'
      } -> `()' #}
 
+withBSData :: BS.ByteString -> (DataBuffer -> IO c) -> IO c
 withBSData bs =
     Ex.bracket (dataNewFromMem bs True)
                dataRelease
 
+withBSBuffer :: (DataBuffer -> IO a) -> IO BS.ByteString
 withBSBuffer f =
     Ex.bracketOnError dataNew
                       dataRelease
@@ -339,3 +389,68 @@ setPassphraseCallback ctx f = do
                return 0
     cb <- mkPasswordCallback cbFun
     withCtx ctx $ \ctxPtr -> {# call set_passphrase_cb #} ctxPtr cb nullPtr
+
+data Engine = Engine { engineProtocol   :: Protocol
+                     , engineFilename   :: Maybe String
+                     , engineHomeDir    :: Maybe String
+                     , engineVersion    :: Maybe String
+                     , engineReqVersion :: Maybe String
+                     } deriving (Show)
+
+getEngines :: Ctx -> IO [Engine]
+getEngines ctx = withCtx ctx $ \ctxPtr ->  do
+    goEngines =<< {#call ctx_get_engine_info #} ctxPtr
+  where
+    goEngines this = if this == nullPtr
+                     then return []
+                     else do
+        engine <- Engine <$> (toEnum' <$> {# get engine_info_t.protocol#} this)
+                         <*> (peekCSM =<< {#get engine_info_t.file_name#}   this)
+                         <*> (peekCSM =<< {#get engine_info_t.home_dir#}    this)
+                         <*> (peekCSM =<< {#get engine_info_t.version#}     this)
+                         <*> (peekCSM =<< {#get engine_info_t.req_version#} this)
+        next <- {# get gpgme_engine_info_t.next #} this
+        (engine:) <$> goEngines next
+    peekCSM cString = if cString == nullPtr
+                      then return Nothing
+                      else Just <$> peekCString cString
+
+setEngine :: Ctx -> Engine -> IO ()
+setEngine ctx eng = withCtx ctx $ \ctxPtr->
+                    withMBCString (engineFilename eng) $ \fNamePtr ->
+                    withMBCString (engineHomeDir eng)  $ \hDirPtr ->
+    throwError =<< {#call ctx_set_engine_info #} ctxPtr
+                                                 (fromEnum' $ engineProtocol eng)
+                                                 fNamePtr
+                                                 hDirPtr
+  where
+    withMBCString Nothing f = f nullPtr
+    withMBCString (Just str) f = withCString str f
+
+{# enum pinentry_mode_t as PinentryMode {underscoreToCase} #}
+
+{# fun set_pinentry_mode as ^
+   { withCtx* `Ctx'
+   , fromEnum' `PinentryMode'
+   } -> `()' throwError*- #}
+
+-------------------------------------------
+-- Key Creation ---------------------------
+-------------------------------------------
+data GenKeyResult = GenKeyResult { genKeyhasPrimary :: Bool
+                                 , genKeyhasSubKey :: Bool
+                                 , genKeyFingerprint :: Maybe BS.ByteString
+                                 } deriving (Show)
+
+genKey :: Ctx -> String -> IO GenKeyResult
+genKey ctx params = withCtx ctx $ \ctxPtr ->
+                    withCString params $ \paramsPtr -> do
+    putStrLn "starting key genearion"
+    throwError =<< {#call gpgme_op_genkey#} ctxPtr paramsPtr nullPtr nullPtr
+    putStrLn "retrieving result"
+    res <- {#call gpgme_op_genkey_result#} ctxPtr
+    putStrLn "Extracting result data"
+    prim <- toEnum' <$> {#get gpgme_genkey_result_t.primary#} res
+    sub <- toEnum' <$> {#get gpgme_genkey_result_t.sub#} res
+    fprint <- maybePeek BS.packCString =<< {#get gpgme_genkey_result_t.fpr#} res
+    return $ GenKeyResult prim sub fprint
