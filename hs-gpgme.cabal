@@ -8,7 +8,7 @@ author:              Philipp Balzarek
 maintainer:          p.balzarek@googlemail.com
 copyright:           2014 Philipp Balzarek
 category:            Cryptography
-build-type:          Simple
+build-type:          Custom
 cabal-version:       >=1.8
 
 library
@@ -22,7 +22,8 @@ library
                    , openpgp
                    , binary
                    , unix
+                   , process
 --  C-Sources:	     src/cbits/wrapper.c
   build-tools:	     c2hs
-  extra-libraries:   gpgme, assuan, gpg-error
+  -- extra-libraries:   gpgme, assuan, gpg-error
   C-Sources:	     src/cbits/wrapper.c
