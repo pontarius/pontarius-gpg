@@ -11,8 +11,8 @@ module GpgMe
        , getKeys
        , keyGetStringAttr
        , ImportStatus(..)
-       , importKey
-       , getKeyBS
+       , importKeys
+       , exportKeys
        , sign
        , SigMode(..)
        , SigStat(..)

@@ -212,20 +212,20 @@ getDataBufferBytes db = do
                return bs
     return res
 
-{# fun gpgme_op_export_keys as exportKey
+{# fun gpgme_op_export_keys as opExportKeys
    { withCtx* `Ctx'
    , withKeysArray* `[Key]'
    , reserved0- `CUInt'
    , fromDataBuffer `DataBuffer'
    } -> `Error' throwError*- #}
 
-data ImportStatus = ImportStatus { isFprint :: String
+data ImportStatus = ImportStatus { isFprint :: BS.ByteString
                                  , isResult :: Maybe Error
                                  , isStatus :: Int -- TODO: convert to flags
                                  }
 
-importKey :: Ctx -> DataBuffer -> IO [ImportStatus]
-importKey ctx keyBuffer = withCtx ctx $ \ctxPtr ->
+importKeyBuffer :: Ctx -> DataBuffer -> IO [ImportStatus]
+importKeyBuffer ctx keyBuffer = withCtx ctx $ \ctxPtr ->
                           withDataBuffer keyBuffer $ \keyPtr -> do
     throwError =<< {#call op_import#} ctxPtr keyPtr
     result <- {#call op_import_result #} ctxPtr
@@ -234,18 +234,19 @@ importKey ctx keyBuffer = withCtx ctx $ \ctxPtr ->
     walkImports ptr = if ptr == nullPtr
                       then return []
                       else do
-        is <- ImportStatus <$> (peekCString =<< {#get import_status_t.fpr #} ptr)
+        is <- ImportStatus <$> (BS.packCString
+                                  =<< {#get import_status_t.fpr #} ptr)
                            <*> (toError =<< {#get import_status_t.result #} ptr)
                            <*> (fromIntegral <$> {#get import_status_t.status #} ptr)
         (is:) <$> (walkImports =<< {#get import_status_t.next #} ptr)
 
 
-importKeyBS ctx bs = withBSData bs $ importKey ctx
+importKeys ctx bs = withBSData bs $ importKeyBuffer ctx
 
-getKeyBS :: Ctx -> Key -> IO BS.ByteString
-getKeyBS ctx key = do
+exportKeys :: Ctx -> [Key] -> IO BS.ByteString
+exportKeys ctx keys = do
     db <- dataNew
-    exp <- exportKey ctx [key] db
+    exp <- opExportKeys ctx keys db
     getDataBufferBytes db
 
 unsafeUseAsCStringLen' :: Num t =>
