@@ -6,8 +6,10 @@
 {-# LANGUAGE NoMonomorphismRestriction #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE DeriveDataTypeable #-}
+{-# LANGUAGE OverloadedStrings #-}
 
 #include <gpgme.h>
+#include <signal.h>
 
 module Bindings where
 
@@ -15,10 +17,12 @@ import           Control.Applicative ((<$>), (<*>))
 import qualified Control.Exception as Ex
 import           Data.Bits
 import qualified Data.ByteString as BS
+import           Data.ByteString (ByteString)
 import qualified Data.ByteString.Unsafe as BS
+import           Data.Data
 import           Data.Text (Text)
 import qualified Data.Text as Text
-import           Data.Typeable
+import qualified Data.Text.Foreign as Text
 import           Foreign.C
 import           Foreign.ForeignPtr
 import           Foreign.Marshal.Alloc
@@ -26,7 +30,7 @@ import           Foreign.Marshal.Array
 import           Foreign.Marshal.Utils
 import           Foreign.Ptr
 import           Foreign.Storable
-import           System.IO.Unsafe (unsafePerformIO)
+
 import           System.Posix.IO
 import           System.Posix.Types
 
@@ -36,11 +40,11 @@ fromEnum' = fromIntegral . fromEnum
 toEnum' :: (Enum c, Integral a) => a -> c
 toEnum' = toEnum . fromIntegral
 
-toFlags :: (Enum a, Num b, Data.Bits.Bits b) => [a] -> b
-toFlags = foldr (.|.) 0 . map fromEnum'
+fromFlags :: (Enum a, Num b, Data.Bits.Bits b) => [a] -> b
+fromFlags = foldr (.|.) 0 . map fromEnum'
 
--- fromFlags x = filter (\y -> let y' = fromEnum' y in x .|. y' == y')
---                      [minBound..maxBound]
+toFlags x = filter (\y -> let y' = fromEnum' y in x .|. y' == y')
+              [minBound..maxBound]
 
 {#context lib = "gpgme" prefix = "gpgme" #}
 
@@ -62,6 +66,9 @@ data Error = Error { errCode :: ErrorCode
                    , errSource :: ErrorSource
                    , errorString :: Text.Text
                    } deriving (Show, Typeable )
+
+noError :: Error
+noError = Error ErrNoError ErrSourceUnknown ""
 
 instance Ex.Exception Error
 
@@ -124,7 +131,8 @@ ctxNew minVersion = do
     _ <- checkVersion minVersion
     ctxNew'
 
-{#enum gpgme_validity_t as Validity {underscoreToCase} deriving (Show) #}
+
+{#enum validity_t as Validity {underscoreToCase} deriving (Show) #}
 {#enum attr_t as Attr {underscoreToCase} deriving (Show) #}
 
 ------------------------------------
@@ -150,8 +158,8 @@ getKeys ctx secretOnly = withCtx ctx $ \ctxPtr -> do
     alloca $ takeKeys ctxPtr
   where
     takeKeys ctxPtr (buf :: Ptr (Ptr Key)) = do
-        e <- toError =<< {#call gpgme_op_keylist_next#} ctxPtr buf
-        case e of
+        err <- toError =<< {#call gpgme_op_keylist_next#} ctxPtr buf
+        case err of
             Nothing -> do
                 keyPtr <- peek buf
                 key <- newForeignPtr unrefPtr keyPtr
@@ -191,10 +199,13 @@ withMaybeText :: Maybe Text -> (Ptr CChar -> IO a) -> IO a
 withMaybeText Nothing = ($ nullPtr)
 withMaybeText (Just txt) = withCString (Text.unpack txt)
 
+
+
 {#fun data_new as ^
    { alloca- `DataBuffer' mkDataBuffer* }
    -> `()' throwError*- #}
 
+peekInt :: (Storable a, Num b, Integral a) => Ptr a -> IO b
 peekInt = fmap fromIntegral . peek
 
 {#fun data_release_and_get_mem as ^
@@ -222,7 +233,7 @@ getDataBufferBytes db = do
 data ImportStatus = ImportStatus { isFprint :: BS.ByteString
                                  , isResult :: Maybe Error
                                  , isStatus :: Int -- TODO: convert to flags
-                                 }
+                                 } deriving (Show)
 
 importKeyBuffer :: Ctx -> DataBuffer -> IO [ImportStatus]
 importKeyBuffer ctx keyBuffer = withCtx ctx $ \ctxPtr ->
@@ -231,30 +242,28 @@ importKeyBuffer ctx keyBuffer = withCtx ctx $ \ctxPtr ->
     result <- {#call op_import_result #} ctxPtr
     walkImports =<< {#get import_result_t.imports#} result
   where
-    walkImports ptr = if ptr == nullPtr
+    walkImports p = if p == nullPtr
                       then return []
                       else do
         is <- ImportStatus <$> (BS.packCString
-                                  =<< {#get import_status_t.fpr #} ptr)
-                           <*> (toError =<< {#get import_status_t.result #} ptr)
-                           <*> (fromIntegral <$> {#get import_status_t.status #} ptr)
-        (is:) <$> (walkImports =<< {#get import_status_t.next #} ptr)
+                                  =<< {#get import_status_t.fpr #} p)
+                           <*> (toError =<< {#get import_status_t.result #} p)
+                           <*> (fromIntegral <$> {#get import_status_t.status #} p)
+        (is:) <$> (walkImports =<< {#get import_status_t.next #} p)
 
 
+importKeys :: Ctx -> ByteString -> IO [ImportStatus]
 importKeys ctx bs = withBSData bs $ importKeyBuffer ctx
 
 exportKeys :: Ctx -> [Key] -> IO BS.ByteString
-exportKeys ctx keys = do
-    db <- dataNew
-    exp <- opExportKeys ctx keys db
-    getDataBufferBytes db
+exportKeys ctx keys = withBSBuffer $ opExportKeys ctx keys
 
 unsafeUseAsCStringLen' :: Num t =>
                           BS.ByteString
                        -> ((Ptr CChar, t) -> IO a)
                        -> IO a
 unsafeUseAsCStringLen' bs f =
-    BS.unsafeUseAsCStringLen bs $ \(bs, l) -> f (bs, fromIntegral l)
+    BS.unsafeUseAsCStringLen bs $ \(bs', l) -> f (bs', fromIntegral l)
 
 {# fun data_new_from_mem as ^
    { alloca- `DataBuffer' mkDataBuffer*
@@ -280,7 +289,7 @@ withBSBuffer f =
     Ex.bracketOnError dataNew
                       dataRelease
                       $ \db -> do
-                          f db
+                          _ <- f db
                           getDataBufferBytes db
 
 
@@ -386,7 +395,7 @@ setPassphraseCallback ctx f = do
                uidHintString <- peekCString uidHint
                pInfoString <- peekCString pInfo
                out <- f uidHintString pInfoString (bad == 0)
-               fdWrite (Fd fd) (filter (/= '\n') out ++ "\n" )
+               _ <- fdWrite (Fd fd) (filter (/= '\n') out ++ "\n" )
                return 0
     cb <- mkPasswordCallback cbFun
     withCtx ctx $ \ctxPtr -> {# call set_passphrase_cb #} ctxPtr cb nullPtr
@@ -405,7 +414,7 @@ getEngines ctx = withCtx ctx $ \ctxPtr ->  do
     goEngines this = if this == nullPtr
                      then return []
                      else do
-        engine <- Engine <$> (toEnum' <$> {# get engine_info_t.protocol#} this)
+        engine <- Engine <$> (toEnum' <$> {# get engine_info_t.protocol#}   this)
                          <*> (peekCSM =<< {#get engine_info_t.file_name#}   this)
                          <*> (peekCSM =<< {#get engine_info_t.home_dir#}    this)
                          <*> (peekCSM =<< {#get engine_info_t.version#}     this)
@@ -455,3 +464,62 @@ genKey ctx params = withCtx ctx $ \ctxPtr ->
     sub <- toEnum' <$> {#get gpgme_genkey_result_t.sub#} res
     fprint <- maybePeek BS.packCString =<< {#get gpgme_genkey_result_t.fpr#} res
     return $ GenKeyResult prim sub fprint
+
+------------------------------------------
+-- Key Deletion --------------------------
+------------------------------------------
+
+{# fun gpgme_op_delete as deleteKey
+ { withCtx* `Ctx'
+ , withKey* `Key'
+ , fromEnum' `Bool'
+ } -> `()' throwError*- #}
+
+------------------------------------------
+-- Key Editing ---------------------------
+------------------------------------------
+
+-- gpgme_error_t (*gpgme_edit_cb_t) (void *handle, gpgme_status_code_t status, const char *args, int fd)
+
+{# enum gpgme_status_code_t as StatusCode {underscoreToCase} deriving (Show, Read, Eq, Data, Typeable, Bounded) #}
+
+type EditCallback' = Ptr () -> CInt -> CString -> CInt -> IO CUInt
+type EditCallback = StatusCode -> Text -> Fd -> IO Error
+
+foreign import ccall "wrapper"
+    mkEditCallback :: EditCallback' -> IO (FunPtr EditCallback')
+
+#c
+gpgme_error_t gpgme_err_make_uninlined ( gpgme_err_source_t err_source
+                                       , gpgme_err_code_t err_code);
+#endc
+
+{# fun gpgme_err_make_uninlined as mkError
+   { fromEnum'  `ErrorSource'
+   , fromEnum' `ErrorCode'
+   }
+   -> `CUInt' id #}
+
+editKey :: Ctx -> Key -> EditCallback -> IO ByteString
+editKey ctx key callback = do
+    let callback' _ scInt cStr fdInt = do
+            str <- if (cStr == nullPtr) then return "" else peekCString cStr
+            err <- callback (toEnum $ fromIntegral scInt) (Text.pack str)
+                            (Fd fdInt)
+            mkError (errSource err) (errCode err)
+    Ex.bracket (mkEditCallback callback') freeHaskellFunPtr
+        $ \cb ->
+        withCtx ctx $ \ctxPtr ->
+        withKey key $ \keyPtr ->
+        withBSBuffer $ \buffer ->
+        withDataBuffer buffer $ \bufferPtr ->
+        throwError =<< {#call gpgme_op_edit#} ctxPtr keyPtr cb nullPtr bufferPtr
+
+-----------------------------------------
+-- Process ------------------------------
+-----------------------------------------
+
+{# fun kill as ^
+    { fromIntegral `CPid'
+    , fromIntegral `Int'
+    } -> `Int' fromIntegral #}
