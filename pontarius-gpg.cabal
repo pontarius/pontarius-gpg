@@ -1,4 +1,4 @@
-name:                hs-gpgme
+name:                pontarius-gpg
 version:             0.0.0
 synopsis:            partial bindings to gpgme
 description:         partial bindings to gpgme
