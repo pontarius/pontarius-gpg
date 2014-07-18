@@ -1,4 +1,4 @@
-hs-gpgme
-=====
+pontarius-gpg
+=============
 
-partial bindings to gpgme
+Bindings to gpgme and gpg
