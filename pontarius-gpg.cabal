@@ -15,8 +15,12 @@ library
   hs-source-dirs:    src
   ghc-options:       -O2
   exposed-modules:   GpgMe
+                   , Gpg.GenRevoke
   other-modules:     Bindings
                    , Gpg.EditKey
+                   , Gpg.Basic
+                   , Gpg.Run
+
   build-depends:     attoparsec
                    , base >= 4 && <5
                    , binary

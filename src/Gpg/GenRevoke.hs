@@ -1,5 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
-module Gpg.Genrevoke where
+module Gpg.GenRevoke where
 
 import           Control.Monad
 import           Data.Text (Text)
