@@ -43,7 +43,10 @@ toEnum' = toEnum . fromIntegral
 fromFlags :: (Enum a, Num b, Data.Bits.Bits b) => [a] -> b
 fromFlags = foldr (.|.) 0 . map fromEnum'
 
-toFlags x = filter (\y -> let y' = fromEnum' y in x .|. y' == y')
+toFlags :: (Data.Bits.Bits a, Eq a, Num a, Enum b, Bounded b) =>
+           a
+        -> [b]
+toFlags x = filter (\y -> let y' = fromEnum' y in x .&. y' /= 0)
               [minBound..maxBound]
 
 {#context lib = "gpgme" prefix = "gpgme" #}
@@ -340,35 +343,78 @@ sign ctx plain key mode = withBSData plain $ \plainData ->
    , withDataBuffer* `DataBuffer' -- plain
    } -> `()' throwError*- #}
 
-checkVerifyResult :: Ctx -> IO SigStat
-checkVerifyResult ctx = withCtx ctx $ \ctx' -> do
-    alloca $ \sigStatPtr -> do
-        res <- {#call get_sig_status#} ctx' 0 sigStatPtr nullPtr
-        if (res == nullPtr)
-            then return SigStatNosig
-            else do
-                sigStat <- peek sigStatPtr
-                return $! (toEnum' sigStat :: SigStat)
 
+data VerifyResult = VerifyResult { summary :: [SigSummary]
+                                 , fingerprint :: ByteString
+                                 , status :: SigStat
+                                 , timestamp :: Integer
+                                 , expTimestamp :: Integer
+                                 , wrongKeyUsage :: Bool
+                                 , pkaTrust :: Int
+                                 , chainModel :: Bool
+                                 , validity :: Validity
+                                 , validityReason :: ErrorCode
+                                 } deriving Show
+
+peekVerifyResults :: Ptr () -> IO [VerifyResult]
+peekVerifyResults ptr | ptr == nullPtr = return []
+                      | otherwise = do
+    summary <- toFlags <$> {#get gpgme_signature_t->summary#} ptr
+    fingerprint <- BS.packCString =<<{# get gpgme_signature_t->fpr#} ptr
+    status' <- gpgme_err_code_uninlined =<< {#get gpgme_signature_t->status#} ptr
+    let status = case toEnum' status' of
+               ErrNoError -> SigStatGood
+               ErrBadSignature -> SigStatBad
+               ErrNoPubkey -> SigStatNokey
+               ErrNoData -> SigStatNosig
+               ErrSigExpired -> SigStatGoodExp
+               ErrKeyExpired -> SigStatGoodExpkey
+               _ -> SigStatError
+    timestamp <- fromIntegral <$> {#get gpgme_signature_t->timestamp#} ptr
+    expTimestamp <- fromIntegral <$> {#get gpgme_signature_t->exp_timestamp#} ptr
+    wrongKeyUsage <- toEnum' <$> {#get gpgme_signature_t->wrong_key_usage#} ptr
+    pkaTrust <- fromIntegral <$> {#get gpgme_signature_t->pka_trust#} ptr
+    chainModel <- toEnum' <$> {#get gpgme_signature_t->chain_model #} ptr
+    validity <- toEnum' <$> {#get gpgme_signature_t->validity #} ptr
+    validityReason <- toEnum' <$> {#get gpgme_signature_t->validity_reason#} ptr
+    let res = VerifyResult { summary = summary
+                           , fingerprint = fingerprint
+                           , status = status
+                           , timestamp = timestamp
+                           , expTimestamp = expTimestamp
+                           , wrongKeyUsage = wrongKeyUsage
+                           , pkaTrust = pkaTrust
+                           , chainModel = chainModel
+                           , validity = validity
+                           , validityReason = validityReason
+                           }
+    next <- {#get gpgme_signature_t->next #} ptr
+    nextResult <- peekVerifyResults next
+    return (res : nextResult)
+
+verifyResult :: Ctx -> IO [VerifyResult]
+verifyResult ctx = withCtx ctx $ \ctxPtr -> do
+    res <- {# call gpgme_op_verify_result #} ctxPtr
+    peekVerifyResults =<< {#get verify_result_t->signatures#} res
 
 -- | Verify a signature created in 'SigModeDetach' mode
 verifyDetach :: Ctx
              -> BS.ByteString -- ^ The source text that the signature pertains to
              -> BS.ByteString -- ^ The signature
-             -> IO SigStat
+             -> IO [VerifyResult]
 verifyDetach ctx signedText sig = withBSData signedText $ \stData ->
                                   withBSData sig $ \sigData -> do
     opVerify ctx sigData stData (DataBuffer nullPtr)
-    checkVerifyResult ctx
+    verifyResult ctx
 
 -- | Verify a signature created in 'SigModeNormal' or 'SigModeClear' mode
 verify :: Ctx
         -> BS.ByteString -- ^ Text and attached Signature
-        -> IO (SigStat, BS.ByteString) -- ^ result and extracted plain text
+        -> IO ([VerifyResult], BS.ByteString) -- ^ result and extracted plain text
 verify ctx sig = withBSData sig $ \sigData -> do
     plain <- withBSBuffer $ \plainData ->
         opVerify ctx sigData (DataBuffer nullPtr) plainData
-    res <- checkVerifyResult ctx
+    res <- verifyResult ctx
     return (res, plain)
 
 --------------------------------
