@@ -23,6 +23,7 @@ module GpgMe
        , SigSummary(..)
        , verifyDetach
        , verify
+       , VerifyResult(..)
        , setPassphraseCallback
        , Engine(..)
        , getEngines
