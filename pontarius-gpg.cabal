@@ -36,13 +36,3 @@ library
   build-tools:	     c2hs
   extra-libraries:   gpgme, assuan, gpg-error
   C-Sources:	     src/cbits/wrapper.c
-
-test-suite tests
-  type:              exitcode-stdio-1.0
-  hs-source-dirs:    tests
-  ghc-options:       -O2
-  main-is:           Main.hs
-  build-depends:     base >= 4 && <5
-                   , text
-                   , bytestring
-                   , hs-gpgme
