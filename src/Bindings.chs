@@ -501,11 +501,8 @@ data GenKeyResult = GenKeyResult { genKeyhasPrimary :: Bool
 genKey :: Ctx -> String -> IO GenKeyResult
 genKey ctx params = withCtx ctx $ \ctxPtr ->
                     withCString params $ \paramsPtr -> do
-    putStrLn "starting key genearion"
     throwError =<< {#call gpgme_op_genkey#} ctxPtr paramsPtr nullPtr nullPtr
-    putStrLn "retrieving result"
     res <- {#call gpgme_op_genkey_result#} ctxPtr
-    putStrLn "Extracting result data"
     prim <- toEnum' <$> {#get gpgme_genkey_result_t.primary#} res
     sub <- toEnum' <$> {#get gpgme_genkey_result_t.sub#} res
     fprint <- maybePeek BS.packCString =<< {#get gpgme_genkey_result_t.fpr#} res
